@@ -1,0 +1,187 @@
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# 1. Select input and output files ------------------------------------------
+
+input_path <- file.choose()
+
+output_path <- readline(
+  prompt = "Enter the full output path, including the file name and extension: "
+)
+
+if (!file.exists(input_path)) {
+  stop("The selected input file does not exist.")
+}
+
+if (output_path == "") {
+  stop("An output path must be provided.")
+}
+
+dat <- read_excel(input_path)
+
+patients <- colnames(dat)[-1]
+
+omics_levels <- c(
+  "Clinical",
+  "Proteome",
+  "Phosphoproteome",
+  "Acetylome"
+)
+
+# 2. Validate the input data ------------------------------------------------
+
+if (!"Clinical" %in% colnames(dat)) {
+  stop("The first column must be named 'Clinical'.")
+}
+
+required_rows <- c(
+  "Proteome",
+  "Phosphoproteome",
+  "Acetylome"
+)
+
+missing_rows <- setdiff(required_rows, dat$Clinical)
+
+if (length(missing_rows) > 0) {
+  stop(
+    paste(
+      "The following omics rows are missing:",
+      paste(missing_rows, collapse = ", ")
+    )
+  )
+}
+
+# 3. Create the presence matrix --------------------------------------------
+
+presence_matrix <- matrix(
+  0,
+  nrow = length(omics_levels),
+  ncol = length(patients),
+  dimnames = list(omics_levels, patients)
+)
+
+presence_matrix["Clinical", ] <- 1
+
+presence_matrix["Proteome", ] <- as.integer(
+  !is.na(unlist(
+    dat[dat$Clinical == "Proteome", -1, drop = FALSE],
+    use.names = FALSE
+  ))
+)
+
+presence_matrix["Phosphoproteome", ] <- as.integer(
+  !is.na(unlist(
+    dat[dat$Clinical == "Phosphoproteome", -1, drop = FALSE],
+    use.names = FALSE
+  ))
+)
+
+presence_matrix["Acetylome", ] <- as.integer(
+  !is.na(unlist(
+    dat[dat$Clinical == "Acetylome", -1, drop = FALSE],
+    use.names = FALSE
+  ))
+)
+
+# 4. Convert the matrix to long format --------------------------------------
+
+df_long <- as.data.frame(presence_matrix) |>
+  mutate(Omics = rownames(.)) |>
+  pivot_longer(
+    cols = -Omics,
+    names_to = "Patient",
+    values_to = "value"
+  ) |>
+  mutate(
+    Patient = factor(Patient, levels = patients),
+    Omics = factor(Omics, levels = rev(omics_levels))
+  )
+
+df_plot <- df_long |>
+  mutate(
+    id = as.numeric(Patient),
+    ring = as.numeric(Omics),
+    fill_group = if_else(
+      value == 1,
+      as.character(Omics),
+      "Missing"
+    )
+  )
+
+# 5. Calculate sample counts ------------------------------------------------
+
+count_df <- df_long |>
+  filter(value == 1) |>
+  group_by(Omics) |>
+  summarise(
+    n = n_distinct(Patient),
+    .groups = "drop"
+  )
+
+omics_order <- levels(df_long$Omics)
+
+sample_counts <- setNames(
+  count_df$n[match(omics_order, count_df$Omics)],
+  omics_order
+)
+
+sample_counts[is.na(sample_counts)] <- 0
+
+legend_labels <- paste0(
+  omics_order,
+  " (n=",
+  sample_counts,
+  ")"
+)
+
+# 6. Create the circular plot -----------------------------------------------
+
+circular_plot <- ggplot(
+  df_plot,
+  aes(x = id, y = ring, fill = fill_group)
+) +
+  geom_tile(
+    width = 1,
+    height = 1,
+    colour = "grey30",
+    linewidth = 0.25
+  ) +
+  coord_polar(start = 0) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0.2, 0.2))
+  ) +
+  scale_fill_manual(
+    name = NULL,
+    breaks = omics_order,
+    labels = legend_labels,
+    values = c(
+      "Clinical" = "#FFD700",
+      "Proteome" = "#1F77B4",
+      "Phosphoproteome" = "#2CA02C",
+      "Acetylome" = "#FF7F0E",
+      "Missing" = "white"
+    )
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.text = element_text(size = 10)
+  )
+
+print(circular_plot)
+
+# 7. Save the plot -----------------------------------------------------------
+
+ggsave(
+  filename = output_path,
+  plot = circular_plot,
+  width = 8,
+  height = 8,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
+
+message("Plot saved to: ", normalizePath(output_path, mustWork = FALSE))
