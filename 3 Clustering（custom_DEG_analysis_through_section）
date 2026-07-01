@@ -1,0 +1,429 @@
+rm(list = ls())
+
+# Load required packages
+library(tidyverse)
+library(limma)
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+
+# Helper function for numeric user input
+read_numeric_value <- function(prompt_text, default_value, lower_bound = NULL, upper_bound = NULL) {
+  user_input <- readline(
+    prompt = paste0(prompt_text, " [default: ", default_value, "]: ")
+  )
+
+  if (trimws(user_input) == "") {
+    value <- default_value
+  } else {
+    value <- suppressWarnings(as.numeric(user_input))
+  }
+
+  if (is.na(value)) {
+    stop("The entered value must be numeric.")
+  }
+
+  if (!is.null(lower_bound) && value < lower_bound) {
+    stop(paste0("The entered value must be at least ", lower_bound, "."))
+  }
+
+  if (!is.null(upper_bound) && value > upper_bound) {
+    stop(paste0("The entered value must not exceed ", upper_bound, "."))
+  }
+
+  return(value)
+}
+
+# 1. Select the input file and output directory
+input_file <- file.choose()
+
+if (!file.exists(input_file)) {
+  stop("The selected input file does not exist.")
+}
+
+default_output_dir <- dirname(input_file)
+
+output_dir <- readline(
+  prompt = paste0(
+    "Enter the output directory [default: ",
+    default_output_dir,
+    "]: "
+  )
+)
+
+if (trimws(output_dir) == "") {
+  output_dir <- default_output_dir
+}
+
+output_dir <- normalizePath(
+  output_dir,
+  winslash = "/",
+  mustWork = FALSE
+)
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# 2. Define user-customized differential-expression thresholds
+logFC_threshold <- read_numeric_value(
+  prompt_text = "Enter the absolute log2 fold-change cutoff",
+  default_value = 0.4,
+  lower_bound = 0
+)
+
+pval_threshold <- read_numeric_value(
+  prompt_text = "Enter the adjusted P-value cutoff",
+  default_value = 0.1,
+  lower_bound = 0,
+  upper_bound = 1
+)
+
+top_n_heatmap <- as.integer(
+  read_numeric_value(
+    prompt_text = "Enter the maximum number of proteins to display in the heatmap",
+    default_value = 50,
+    lower_bound = 1
+  )
+)
+
+# 3. Read the data
+df <- read_csv(input_file, show_col_types = FALSE)
+
+if (ncol(df) < 2 || nrow(df) < 2) {
+  stop("The input file must contain at least two rows and two columns.")
+}
+
+# 4. Preprocess the data
+survival_data <- as.numeric(df[1, -1])
+
+gene_expression <- df[-1, ]
+gene_names <- as.character(gene_expression[[1]])
+
+expression_matrix <- as.matrix(gene_expression[, -1])
+storage.mode(expression_matrix) <- "numeric"
+rownames(expression_matrix) <- gene_names
+
+if (length(survival_data) != ncol(expression_matrix)) {
+  stop("The number of survival values does not match the number of expression samples.")
+}
+
+if (is.null(colnames(expression_matrix))) {
+  stop("The expression matrix must contain sample names.")
+}
+
+# 5. Divide samples according to the median survival time
+survival_median <- median(survival_data, na.rm = TRUE)
+
+group <- ifelse(
+  survival_data > survival_median,
+  "High_Survival",
+  "Low_Survival"
+)
+
+group <- factor(
+  group,
+  levels = c("Low_Survival", "High_Survival")
+)
+
+print(table(group))
+
+# 6. Create the sample information table
+sample_info <- data.frame(
+  Sample = colnames(expression_matrix),
+  Survival_Time = survival_data,
+  Group = group,
+  stringsAsFactors = FALSE
+)
+
+# 7. Perform data quality checks
+if (any(is.na(expression_matrix))) {
+  cat("Missing expression values were detected. Genes containing missing values will be removed.\n")
+
+  genes_with_na <- apply(
+    expression_matrix,
+    1,
+    function(x) any(is.na(x))
+  )
+
+  expression_matrix <- expression_matrix[!genes_with_na, , drop = FALSE]
+  gene_names <- gene_names[!genes_with_na]
+}
+
+if (nrow(expression_matrix) == 0) {
+  stop("No genes remain after removing rows containing missing values.")
+}
+
+cat(
+  "Expression matrix dimensions:",
+  nrow(expression_matrix),
+  "genes x",
+  ncol(expression_matrix),
+  "samples\n"
+)
+
+cat(
+  "High-survival samples:",
+  sum(group == "High_Survival"),
+  "\n"
+)
+
+cat(
+  "Low-survival samples:",
+  sum(group == "Low_Survival"),
+  "\n"
+)
+
+# 8. Plot the survival-time distribution
+survival_distribution_plot <- ggplot(
+  sample_info,
+  aes(x = Group, y = Survival_Time, fill = Group)
+) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.5) +
+  labs(
+    title = "Survival Time Distribution",
+    x = "Group",
+    y = "Survival Time (Days)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+print(survival_distribution_plot)
+
+ggsave(
+  filename = file.path(output_dir, "survival_time_distribution.png"),
+  plot = survival_distribution_plot,
+  width = 7,
+  height = 6,
+  dpi = 300
+)
+
+# 9. Perform differential-expression analysis with limma
+design <- model.matrix(~ group)
+colnames(design)[2] <- "High_vs_Low"
+
+fit <- lmFit(expression_matrix, design)
+fit <- eBayes(fit)
+
+de_results <- topTable(
+  fit,
+  coef = "High_vs_Low",
+  number = Inf,
+  adjust.method = "BH",
+  sort.by = "P"
+)
+
+de_results$Gene <- rownames(de_results)
+
+de_results$Significant <- ifelse(
+  de_results$adj.P.Val < pval_threshold &
+    abs(de_results$logFC) > logFC_threshold,
+  ifelse(
+    de_results$logFC > 0,
+    "Up-regulated",
+    "Down-regulated"
+  ),
+  "Not significant"
+)
+
+differential_counts <- table(de_results$Significant)
+
+cat("\nDifferential-expression summary:\n")
+print(differential_counts)
+
+# 10. Create the volcano plot
+plot_data <- de_results |>
+  mutate(
+    Adjusted_P_for_Plot = pmax(
+      adj.P.Val,
+      .Machine$double.xmin
+    )
+  )
+
+volcano_plot <- ggplot(
+  plot_data,
+  aes(
+    x = logFC,
+    y = -log10(Adjusted_P_for_Plot),
+    color = Significant
+  )
+) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_color_manual(
+    values = c(
+      "Down-regulated" = "blue",
+      "Not significant" = "grey",
+      "Up-regulated" = "red"
+    )
+  ) +
+  geom_hline(
+    yintercept = -log10(pval_threshold),
+    linetype = "dashed",
+    color = "black"
+  ) +
+  geom_vline(
+    xintercept = c(-logFC_threshold, logFC_threshold),
+    linetype = "dashed",
+    color = "black"
+  ) +
+  labs(
+    title = "Differential Expression Volcano Plot",
+    subtitle = paste0(
+      "Up-regulated: ",
+      sum(de_results$Significant == "Up-regulated"),
+      " | Down-regulated: ",
+      sum(de_results$Significant == "Down-regulated"),
+      " | |log2FC| > ",
+      logFC_threshold,
+      " | Adjusted P < ",
+      pval_threshold
+    ),
+    x = "Log2 Fold Change",
+    y = "-Log10 Adjusted P-value",
+    color = "Expression"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    plot.subtitle = element_text(size = 10, color = "gray30")
+  )
+
+print(volcano_plot)
+
+ggsave(
+  filename = file.path(output_dir, "differential_expression_volcano_plot.png"),
+  plot = volcano_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+# 11. Create a heatmap and save differential-expression results
+significant_genes <- de_results |>
+  filter(Significant %in% c("Up-regulated", "Down-regulated")) |>
+  arrange(adj.P.Val) |>
+  slice_head(n = top_n_heatmap)
+
+if (nrow(significant_genes) > 0) {
+  significant_expression <- expression_matrix[
+    significant_genes$Gene,
+    ,
+    drop = FALSE
+  ]
+
+  significant_expression_scaled <- t(
+    scale(t(significant_expression))
+  )
+
+  valid_rows <- apply(
+    significant_expression_scaled,
+    1,
+    function(x) all(is.finite(x))
+  )
+
+  significant_expression_scaled <- significant_expression_scaled[
+    valid_rows,
+    ,
+    drop = FALSE
+  ]
+
+  significant_genes <- significant_genes[
+    match(
+      rownames(significant_expression_scaled),
+      significant_genes$Gene
+    ),
+    ,
+    drop = FALSE
+  ]
+
+  if (nrow(significant_expression_scaled) > 0) {
+    column_order <- order(survival_data, decreasing = TRUE)
+
+    significant_expression_scaled <- significant_expression_scaled[
+      ,
+      column_order,
+      drop = FALSE
+    ]
+
+    column_annotation <- data.frame(
+      Group = factor(
+        group[column_order],
+        levels = c("Low_Survival", "High_Survival")
+      ),
+      Survival_Days = survival_data[column_order]
+    )
+
+    rownames(column_annotation) <- colnames(significant_expression_scaled)
+
+    row_annotation <- data.frame(
+      Expression = significant_genes$Significant
+    )
+
+    rownames(row_annotation) <- significant_genes$Gene
+
+    annotation_colors <- list(
+      Group = c(
+        Low_Survival = "#99CCFF",
+        High_Survival = "#FF9999"
+      ),
+      Expression = c(
+        `Up-regulated` = "#E41A1C",
+        `Down-regulated` = "#377EB8"
+      )
+    )
+
+    heatmap_file <- file.path(
+      output_dir,
+      "differential_expression_heatmap.png"
+    )
+
+    png(
+      filename = heatmap_file,
+      width = 3000,
+      height = max(1800, nrow(significant_expression_scaled) * 60),
+      res = 300
+    )
+
+    pheatmap(
+      significant_expression_scaled,
+      annotation_col = column_annotation,
+      annotation_row = row_annotation,
+      annotation_colors = annotation_colors,
+      show_rownames = TRUE,
+      show_colnames = FALSE,
+      cluster_rows = TRUE,
+      cluster_cols = FALSE,
+      color = colorRampPalette(
+        c("#0571B0", "white", "#C51B7D")
+      )(50),
+      main = "Differential Expression Heatmap",
+      fontsize_row = 8
+    )
+
+    dev.off()
+  } else {
+    cat(
+      "The heatmap was not generated because all selected rows had zero variance or non-finite scaled values.\n"
+    )
+  }
+} else {
+  cat(
+    "No significant genes met the customized thresholds. The heatmap was not generated.\n"
+  )
+}
+
+results_file <- file.path(
+  output_dir,
+  "differential_expression_results.csv"
+)
+
+write.csv(
+  de_results,
+  results_file,
+  row.names = FALSE
+)
+
+cat("\nAnalysis completed.\n")
+cat("Results were saved to:", output_dir, "\n")
+cat("Differential-expression results:", results_file, "\n")
