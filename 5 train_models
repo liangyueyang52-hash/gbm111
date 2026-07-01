@@ -1,0 +1,581 @@
+"""Train and evaluate classification models from an analysis-ready table."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import warnings
+from pathlib import Path
+from typing import Any
+
+import joblib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from sklearn.base import ClassifierMixin, clone
+from sklearn.ensemble import (
+    AdaBoostClassifier,
+    ExtraTreesClassifier,
+    GradientBoostingClassifier,
+    RandomForestClassifier,
+    StackingClassifier,
+    VotingClassifier,
+)
+from sklearn.linear_model import LogisticRegression, RidgeClassifier, SGDClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+)
+from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
+from sklearn.naive_bayes import GaussianNB
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.svm import LinearSVC, SVC
+from sklearn.tree import DecisionTreeClassifier
+
+warnings.filterwarnings("ignore")
+
+DEFAULT_EXCLUDED_COLUMNS = [
+    "Sample",
+    "Survival_Days",
+    "Survival_Threshold",
+    "Survival_Group",
+]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Read an analysis-ready CSV/TSV file, train classification models, "
+            "and save evaluation results. No imputation, scaling, preprocessing, "
+            "or feature selection is performed."
+        )
+    )
+    parser.add_argument("--input", required=True, help="Path to the input CSV or TSV file.")
+    parser.add_argument("--output-dir", required=True, help="Directory for all output files.")
+    parser.add_argument(
+        "--target-column",
+        default="Survival_Class",
+        help="Binary target column. Default: Survival_Class",
+    )
+    parser.add_argument(
+        "--id-column",
+        default="Sample",
+        help="Sample identifier column used in prediction output. Default: Sample",
+    )
+    parser.add_argument(
+        "--exclude-columns",
+        nargs="*",
+        default=DEFAULT_EXCLUDED_COLUMNS,
+        help="Non-feature columns to exclude in addition to the target column.",
+    )
+    parser.add_argument("--test-size", type=float, default=0.30, help="Test fraction. Default: 0.30")
+    parser.add_argument("--cv-folds", type=int, default=10, help="Maximum CV folds. Default: 10")
+    parser.add_argument("--random-state", type=int, default=42, help="Random seed. Default: 42")
+    parser.add_argument(
+        "--delimiter",
+        default=None,
+        help="Optional delimiter. By default, comma is used for .csv and tab for .tsv/.txt.",
+    )
+    return parser.parse_args()
+
+
+def detect_delimiter(input_path: Path, delimiter: str | None) -> str:
+    if delimiter is not None:
+        return delimiter
+    if input_path.suffix.lower() in {".tsv", ".txt"}:
+        return "\t"
+    return ","
+
+
+def load_training_data(
+    input_path: Path,
+    target_column: str,
+    id_column: str,
+    excluded_columns: list[str],
+    delimiter: str | None,
+) -> tuple[pd.DataFrame, pd.Series, pd.Series, list[str]]:
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input file does not exist: {input_path}")
+
+    df = pd.read_csv(input_path, sep=detect_delimiter(input_path, delimiter))
+    if df.empty:
+        raise ValueError("The input file is empty.")
+    if target_column not in df.columns:
+        raise ValueError(f"Target column '{target_column}' was not found.")
+
+    sample_ids = (
+        df[id_column].astype(str)
+        if id_column in df.columns
+        else pd.Series(df.index.astype(str), index=df.index, name=id_column)
+    )
+
+    excluded = set(excluded_columns) | {target_column}
+    feature_columns = [column for column in df.columns if column not in excluded]
+    if not feature_columns:
+        raise ValueError("No feature columns remain after excluding metadata and target columns.")
+
+    X = df.loc[:, feature_columns].copy()
+    non_numeric_columns = X.select_dtypes(exclude=[np.number]).columns.tolist()
+    if non_numeric_columns:
+        raise ValueError(
+            "All feature columns must already be numeric. Non-numeric columns: "
+            + ", ".join(non_numeric_columns)
+        )
+
+    if X.isna().any().any():
+        missing_columns = X.columns[X.isna().any()].tolist()
+        raise ValueError(
+            "Feature data contain missing values. This training-only script does not impute data. "
+            "Columns with missing values: " + ", ".join(missing_columns[:20])
+        )
+
+    if np.isinf(X.to_numpy(dtype=float)).any():
+        raise ValueError("Feature data contain infinite values.")
+
+    y = df[target_column].copy()
+    if y.isna().any():
+        raise ValueError(f"Target column '{target_column}' contains missing values.")
+
+    unique_classes = pd.unique(y)
+    if len(unique_classes) != 2:
+        raise ValueError(
+            f"Binary classification requires exactly two target classes; found {len(unique_classes)}."
+        )
+
+    if not pd.api.types.is_numeric_dtype(y):
+        class_mapping = {value: index for index, value in enumerate(sorted(unique_classes.astype(str)))}
+        y = y.astype(str).map(class_mapping)
+    else:
+        sorted_classes = sorted(pd.unique(y))
+        class_mapping = {value: index for index, value in enumerate(sorted_classes)}
+        y = y.map(class_mapping)
+
+    y = y.astype(int)
+    if y.value_counts().min() < 2:
+        raise ValueError("Each target class must contain at least two samples.")
+
+    return X, y, sample_ids, feature_columns
+
+
+def build_models(random_state: int) -> dict[str, ClassifierMixin]:
+    models: dict[str, ClassifierMixin] = {
+        "Logistic Regression L2": LogisticRegression(
+            penalty="l2", C=0.1, max_iter=3000, solver="liblinear",
+            class_weight="balanced", random_state=random_state,
+        ),
+        "Logistic Regression L1": LogisticRegression(
+            penalty="l1", C=0.1, max_iter=3000, solver="liblinear",
+            class_weight="balanced", random_state=random_state,
+        ),
+        "Ridge Classifier": RidgeClassifier(alpha=0.5, class_weight="balanced"),
+        "Elastic Net SGD": SGDClassifier(
+            loss="log_loss", penalty="elasticnet", alpha=0.001, l1_ratio=0.5,
+            max_iter=3000, class_weight="balanced", random_state=random_state,
+        ),
+        "Linear SVM": LinearSVC(
+            C=0.1, max_iter=5000, dual=False, class_weight="balanced",
+            random_state=random_state,
+        ),
+        "RBF SVM": SVC(
+            C=1.0, kernel="rbf", gamma="scale", probability=True,
+            class_weight="balanced", random_state=random_state,
+        ),
+        "Random Forest": RandomForestClassifier(
+            n_estimators=300, max_depth=8, min_samples_split=5, min_samples_leaf=2,
+            max_features="sqrt", class_weight="balanced", random_state=random_state,
+            n_jobs=-1,
+        ),
+        "Extra Trees": ExtraTreesClassifier(
+            n_estimators=300, max_depth=8, min_samples_split=5, min_samples_leaf=2,
+            max_features="sqrt", class_weight="balanced", random_state=random_state,
+            n_jobs=-1,
+        ),
+        "Decision Tree": DecisionTreeClassifier(
+            max_depth=5, min_samples_split=5, min_samples_leaf=2,
+            class_weight="balanced", random_state=random_state,
+        ),
+        "Gradient Boosting": GradientBoostingClassifier(
+            n_estimators=200, learning_rate=0.1, max_depth=5,
+            min_samples_split=5, min_samples_leaf=2, subsample=0.8,
+            random_state=random_state,
+        ),
+        "AdaBoost": AdaBoostClassifier(
+            n_estimators=200, learning_rate=0.1, random_state=random_state,
+        ),
+        "KNN": KNeighborsClassifier(n_neighbors=5),
+        "Naive Bayes": GaussianNB(),
+        "MLP": MLPClassifier(
+            hidden_layer_sizes=(100, 50, 25), activation="relu", solver="adam",
+            alpha=0.01, max_iter=3000, early_stopping=True, batch_size=32,
+            learning_rate_init=0.001, random_state=random_state,
+        ),
+    }
+
+    try:
+        from xgboost import XGBClassifier
+
+        models["XGBoost"] = XGBClassifier(
+            n_estimators=200, learning_rate=0.1, max_depth=5,
+            min_child_weight=1, subsample=0.8, colsample_bytree=0.8,
+            eval_metric="logloss", random_state=random_state, n_jobs=-1,
+        )
+    except ImportError:
+        pass
+
+    try:
+        from lightgbm import LGBMClassifier
+
+        models["LightGBM"] = LGBMClassifier(
+            n_estimators=200, learning_rate=0.1, max_depth=5, num_leaves=31,
+            subsample=0.8, colsample_bytree=0.8, class_weight="balanced",
+            random_state=random_state, verbosity=-1, n_jobs=-1,
+        )
+    except ImportError:
+        pass
+
+    try:
+        from catboost import CatBoostClassifier
+
+        models["CatBoost"] = CatBoostClassifier(
+            iterations=200, learning_rate=0.1, depth=5,
+            random_state=random_state, verbose=0,
+        )
+    except ImportError:
+        pass
+
+    return models
+
+
+def prediction_scores(model: ClassifierMixin, X: pd.DataFrame) -> np.ndarray:
+    if hasattr(model, "predict_proba"):
+        return np.asarray(model.predict_proba(X))[:, 1]
+    if hasattr(model, "decision_function"):
+        return np.asarray(model.decision_function(X), dtype=float)
+    return np.asarray(model.predict(X), dtype=float)
+
+
+def safe_auc(y_true: pd.Series, scores: np.ndarray) -> float:
+    try:
+        return float(roc_auc_score(y_true, scores))
+    except ValueError:
+        return float("nan")
+
+
+def train_and_evaluate(
+    X: pd.DataFrame,
+    y: pd.Series,
+    sample_ids: pd.Series,
+    models: dict[str, ClassifierMixin],
+    test_size: float,
+    cv_folds: int,
+    random_state: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any], str, pd.Series]:
+    indices = np.arange(len(X))
+    train_idx, test_idx = train_test_split(
+        indices,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=y,
+    )
+
+    X_train = X.iloc[train_idx]
+    X_test = X.iloc[test_idx]
+    y_train = y.iloc[train_idx]
+    y_test = y.iloc[test_idx]
+
+    minimum_class_count = int(y_train.value_counts().min())
+    effective_cv_folds = min(cv_folds, minimum_class_count)
+    if effective_cv_folds < 2:
+        raise ValueError("The training set does not contain enough samples for stratified cross-validation.")
+
+    cv = StratifiedKFold(
+        n_splits=effective_cv_folds,
+        shuffle=True,
+        random_state=random_state,
+    )
+
+    fitted_models: dict[str, Any] = {}
+    metric_rows: list[dict[str, Any]] = []
+    prediction_data: dict[str, Any] = {
+        "Sample": sample_ids.iloc[test_idx].to_numpy(),
+        "True_Label": y_test.to_numpy(),
+    }
+
+    for name, estimator in models.items():
+        print(f"Training {name}...")
+        try:
+            cv_scores = cross_val_score(
+                clone(estimator), X_train, y_train, cv=cv, scoring="roc_auc", n_jobs=-1
+            )
+            estimator.fit(X_train, y_train)
+            y_pred = estimator.predict(X_test)
+            y_score = prediction_scores(estimator, X_test)
+
+            fitted_models[name] = estimator
+            prediction_data[f"{name}_Prediction"] = y_pred
+            prediction_data[f"{name}_Score"] = y_score
+
+            metric_rows.append(
+                {
+                    "Model": name,
+                    "CV_AUC_Mean": float(np.mean(cv_scores)),
+                    "CV_AUC_SD": float(np.std(cv_scores)),
+                    "Test_AUC": safe_auc(y_test, y_score),
+                    "Accuracy": float(accuracy_score(y_test, y_pred)),
+                    "Precision": float(precision_score(y_test, y_pred, zero_division=0)),
+                    "Recall": float(recall_score(y_test, y_pred, zero_division=0)),
+                    "F1": float(f1_score(y_test, y_pred, zero_division=0)),
+                    "Status": "Success",
+                    "Error": "",
+                }
+            )
+        except Exception as exc:
+            metric_rows.append(
+                {
+                    "Model": name,
+                    "CV_AUC_Mean": np.nan,
+                    "CV_AUC_SD": np.nan,
+                    "Test_AUC": np.nan,
+                    "Accuracy": np.nan,
+                    "Precision": np.nan,
+                    "Recall": np.nan,
+                    "F1": np.nan,
+                    "Status": "Failed",
+                    "Error": str(exc),
+                }
+            )
+            print(f"Failed: {name}: {exc}")
+
+    successful_metrics = pd.DataFrame(metric_rows)
+    successful_names = successful_metrics.loc[
+        successful_metrics["Status"] == "Success", "Model"
+    ].tolist()
+
+    probability_models = [
+        (name, fitted_models[name])
+        for name in successful_names
+        if hasattr(fitted_models[name], "predict_proba")
+    ]
+    ranked_probability_models = sorted(
+        probability_models,
+        key=lambda item: successful_metrics.loc[
+            successful_metrics["Model"] == item[0], "Test_AUC"
+        ].iloc[0],
+        reverse=True,
+    )
+
+    if len(ranked_probability_models) >= 3:
+        voting_estimators = [
+            (f"model_{index}", clone(model))
+            for index, (_, model) in enumerate(ranked_probability_models[:5])
+        ]
+        voting = VotingClassifier(estimators=voting_estimators, voting="soft", n_jobs=-1)
+        voting.fit(X_train, y_train)
+        y_pred = voting.predict(X_test)
+        y_score = voting.predict_proba(X_test)[:, 1]
+        fitted_models["Soft Voting"] = voting
+        prediction_data["Soft Voting_Prediction"] = y_pred
+        prediction_data["Soft Voting_Score"] = y_score
+        successful_metrics.loc[len(successful_metrics)] = {
+            "Model": "Soft Voting",
+            "CV_AUC_Mean": np.nan,
+            "CV_AUC_SD": np.nan,
+            "Test_AUC": safe_auc(y_test, y_score),
+            "Accuracy": float(accuracy_score(y_test, y_pred)),
+            "Precision": float(precision_score(y_test, y_pred, zero_division=0)),
+            "Recall": float(recall_score(y_test, y_pred, zero_division=0)),
+            "F1": float(f1_score(y_test, y_pred, zero_division=0)),
+            "Status": "Success",
+            "Error": "",
+        }
+
+    if all(name in fitted_models for name in ["Random Forest", "RBF SVM", "Logistic Regression L2"]):
+        stacking = StackingClassifier(
+            estimators=[
+                ("rf", clone(models["Random Forest"])),
+                ("svm", clone(models["RBF SVM"])),
+                ("lr", clone(models["Logistic Regression L2"])),
+            ],
+            final_estimator=LogisticRegression(max_iter=3000, random_state=random_state),
+            cv=min(5, effective_cv_folds),
+            n_jobs=-1,
+        )
+        stacking.fit(X_train, y_train)
+        y_pred = stacking.predict(X_test)
+        y_score = stacking.predict_proba(X_test)[:, 1]
+        fitted_models["Stacking"] = stacking
+        prediction_data["Stacking_Prediction"] = y_pred
+        prediction_data["Stacking_Score"] = y_score
+        successful_metrics.loc[len(successful_metrics)] = {
+            "Model": "Stacking",
+            "CV_AUC_Mean": np.nan,
+            "CV_AUC_SD": np.nan,
+            "Test_AUC": safe_auc(y_test, y_score),
+            "Accuracy": float(accuracy_score(y_test, y_pred)),
+            "Precision": float(precision_score(y_test, y_pred, zero_division=0)),
+            "Recall": float(recall_score(y_test, y_pred, zero_division=0)),
+            "F1": float(f1_score(y_test, y_pred, zero_division=0)),
+            "Status": "Success",
+            "Error": "",
+        }
+
+    valid_metrics = successful_metrics[
+        (successful_metrics["Status"] == "Success") & successful_metrics["Test_AUC"].notna()
+    ]
+    if valid_metrics.empty:
+        raise RuntimeError("No model completed successfully with a valid test AUC.")
+
+    best_model_name = valid_metrics.sort_values("Test_AUC", ascending=False).iloc[0]["Model"]
+    predictions = pd.DataFrame(prediction_data)
+    return successful_metrics, predictions, fitted_models, best_model_name, y_test
+
+
+def save_plots(
+    metrics: pd.DataFrame,
+    predictions: pd.DataFrame,
+    best_model_name: str,
+    output_dir: Path,
+) -> None:
+    valid = metrics[(metrics["Status"] == "Success") & metrics["Test_AUC"].notna()].copy()
+    valid = valid.sort_values("Test_AUC", ascending=True)
+
+    plt.figure(figsize=(10, max(5, len(valid) * 0.35)))
+    plt.barh(valid["Model"], valid["Test_AUC"])
+    plt.xlabel("Test AUC")
+    plt.ylabel("Model")
+    plt.title("Model Test AUC Comparison")
+    plt.xlim(0, 1)
+    plt.tight_layout()
+    plt.savefig(output_dir / "model_auc_comparison.png", dpi=300)
+    plt.close()
+
+    score_column = f"{best_model_name}_Score"
+    prediction_column = f"{best_model_name}_Prediction"
+    y_true = predictions["True_Label"]
+    y_score = predictions[score_column]
+    y_pred = predictions[prediction_column]
+
+    fpr, tpr, _ = roc_curve(y_true, y_score)
+    auc_value = roc_auc_score(y_true, y_score)
+    plt.figure(figsize=(6, 6))
+    plt.plot(fpr, tpr, label=f"{best_model_name} (AUC={auc_value:.3f})")
+    plt.plot([0, 1], [0, 1], linestyle="--")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("Best Model ROC Curve")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_dir / "best_model_roc.png", dpi=300)
+    plt.close()
+
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(5, 5))
+    plt.imshow(cm)
+    plt.title(f"Confusion Matrix: {best_model_name}")
+    plt.xlabel("Predicted Label")
+    plt.ylabel("True Label")
+    plt.xticks([0, 1], ["0", "1"])
+    plt.yticks([0, 1], ["0", "1"])
+    for row in range(cm.shape[0]):
+        for column in range(cm.shape[1]):
+            plt.text(column, row, str(cm[row, column]), ha="center", va="center")
+    plt.tight_layout()
+    plt.savefig(output_dir / "best_model_confusion_matrix.png", dpi=300)
+    plt.close()
+
+
+def save_outputs(
+    output_dir: Path,
+    metrics: pd.DataFrame,
+    predictions: pd.DataFrame,
+    fitted_models: dict[str, Any],
+    best_model_name: str,
+    feature_columns: list[str],
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metrics.sort_values(["Status", "Test_AUC"], ascending=[False, False]).to_csv(
+        output_dir / "model_metrics.csv", index=False
+    )
+    predictions.to_csv(output_dir / "test_predictions.csv", index=False)
+    joblib.dump(fitted_models[best_model_name], output_dir / "best_model.joblib")
+
+    best_prediction = predictions[f"{best_model_name}_Prediction"]
+    report = classification_report(
+        predictions["True_Label"], best_prediction, digits=4, zero_division=0
+    )
+    (output_dir / "best_model_classification_report.txt").write_text(report, encoding="utf-8")
+
+    metadata = {
+        "best_model": best_model_name,
+        "feature_count": len(feature_columns),
+        "feature_columns": feature_columns,
+    }
+    (output_dir / "training_metadata.json").write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+    save_plots(metrics, predictions, best_model_name, output_dir)
+
+
+def main() -> None:
+    args = parse_args()
+    input_path = Path(args.input).expanduser().resolve()
+    output_dir = Path(args.output_dir).expanduser().resolve()
+
+    print("=" * 80)
+    print("MODEL TRAINING AND EVALUATION")
+    print("=" * 80)
+    print(f"Input file: {input_path}")
+    print(f"Output directory: {output_dir}")
+
+    X, y, sample_ids, feature_columns = load_training_data(
+        input_path=input_path,
+        target_column=args.target_column,
+        id_column=args.id_column,
+        excluded_columns=args.exclude_columns,
+        delimiter=args.delimiter,
+    )
+
+    print(f"Samples: {X.shape[0]}")
+    print(f"Features: {X.shape[1]}")
+    print(f"Class counts: {y.value_counts().sort_index().to_dict()}")
+
+    models = build_models(args.random_state)
+    metrics, predictions, fitted_models, best_model_name, _ = train_and_evaluate(
+        X=X,
+        y=y,
+        sample_ids=sample_ids,
+        models=models,
+        test_size=args.test_size,
+        cv_folds=args.cv_folds,
+        random_state=args.random_state,
+    )
+
+    save_outputs(
+        output_dir=output_dir,
+        metrics=metrics,
+        predictions=predictions,
+        fitted_models=fitted_models,
+        best_model_name=best_model_name,
+        feature_columns=feature_columns,
+    )
+
+    best_row = metrics.loc[metrics["Model"] == best_model_name].iloc[0]
+    print("=" * 80)
+    print(f"Best model: {best_model_name}")
+    print(f"Test AUC: {best_row['Test_AUC']:.4f}")
+    print(f"Accuracy: {best_row['Accuracy']:.4f}")
+    print(f"F1: {best_row['F1']:.4f}")
+    print(f"Results saved to: {output_dir}")
+    print("=" * 80)
+
+
+if __name__ == "__main__":
+    main()
