@@ -1,0 +1,434 @@
+import os
+import warnings
+from tkinter import Tk, filedialog
+
+import numpy as np
+import pandas as pd
+from sklearn.feature_selection import RFE, SelectKBest, VarianceThreshold, f_classif, mutual_info_classif
+from sklearn.impute import KNNImputer, SimpleImputer
+from sklearn.linear_model import Lasso, LogisticRegression
+from sklearn.preprocessing import StandardScaler
+
+warnings.filterwarnings("ignore")
+
+
+def choose_input_file():
+    root = Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    file_path = filedialog.askopenfilename(
+        title="Select the input CSV file",
+        filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+    )
+    root.destroy()
+
+    if not file_path:
+        raise ValueError("No input file was selected.")
+
+    return file_path
+
+
+def choose_output_file(default_name="processed_selected_features.csv"):
+    root = Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    file_path = filedialog.asksaveasfilename(
+        title="Select the output CSV file",
+        defaultextension=".csv",
+        initialfile=default_name,
+        filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+    )
+    root.destroy()
+
+    if not file_path:
+        raise ValueError("No output file was selected.")
+
+    return file_path
+
+
+def prompt_value(prompt, default, cast_type, validator=None):
+    raw_value = input(f"{prompt} [default: {default}]: ").strip()
+
+    if raw_value == "":
+        value = default
+    else:
+        try:
+            value = cast_type(raw_value)
+        except ValueError as exc:
+            raise ValueError(f"Invalid value entered for: {prompt}") from exc
+
+    if validator is not None and not validator(value):
+        raise ValueError(f"Value is outside the allowed range for: {prompt}")
+
+    return value
+
+
+def load_data(file_path):
+    print("=" * 80)
+    print("STEP 1: DATA LOADING")
+    print("=" * 80)
+
+    data = pd.read_csv(file_path)
+
+    if data.shape[0] < 2 or data.shape[1] < 2:
+        raise ValueError(
+            "The input file must contain at least two rows and two columns."
+        )
+
+    sample_names = data.columns[1:].astype(str).to_numpy()
+    survival_days = pd.to_numeric(
+        data.iloc[0, 1:], errors="coerce"
+    ).to_numpy(dtype=float)
+
+    gene_names = data.iloc[1:, 0].astype(str).to_numpy()
+    expression_data = (
+        data.iloc[1:, 1:]
+        .apply(pd.to_numeric, errors="coerce")
+        .to_numpy(dtype=float)
+        .T
+    )
+
+    valid_survival = ~np.isnan(survival_days)
+
+    if not valid_survival.all():
+        removed_count = int((~valid_survival).sum())
+        print(
+            f"Removing {removed_count} sample(s) with missing survival values."
+        )
+        survival_days = survival_days[valid_survival]
+        expression_data = expression_data[valid_survival, :]
+        sample_names = sample_names[valid_survival]
+
+    all_missing_features = np.isnan(expression_data).all(axis=0)
+
+    if all_missing_features.any():
+        removed_count = int(all_missing_features.sum())
+        print(
+            f"Removing {removed_count} feature(s) containing only missing values."
+        )
+        expression_data = expression_data[:, ~all_missing_features]
+        gene_names = gene_names[~all_missing_features]
+
+    if expression_data.shape[1] != len(gene_names):
+        raise ValueError(
+            "The expression matrix and feature-name vector have inconsistent dimensions."
+        )
+
+    if expression_data.shape[0] < 4:
+        raise ValueError("At least four valid samples are required.")
+
+    print(f"Samples retained: {expression_data.shape[0]}")
+    print(f"Features retained: {expression_data.shape[1]}")
+
+    return expression_data, survival_days, gene_names, sample_names
+
+
+def create_survival_labels(survival_days, threshold_text):
+    print("\n" + "=" * 80)
+    print("STEP 2: LABEL CREATION")
+    print("=" * 80)
+
+    if threshold_text.lower() == "median":
+        threshold_value = float(np.median(survival_days))
+    else:
+        try:
+            threshold_value = float(threshold_text)
+        except ValueError as exc:
+            raise ValueError(
+                "The survival threshold must be 'median' or a numeric value."
+            ) from exc
+
+    labels = (survival_days > threshold_value).astype(int)
+
+    class_counts = np.bincount(labels, minlength=2)
+
+    if np.any(class_counts == 0):
+        raise ValueError(
+            "The selected survival threshold produced only one class."
+        )
+
+    print(f"Survival threshold: {threshold_value:.4f}")
+    print(f"Class 0 samples: {class_counts[0]}")
+    print(f"Class 1 samples: {class_counts[1]}")
+
+    return labels, threshold_value
+
+
+def impute_missing_values(expression_data, strategy, knn_neighbors):
+    print("\n" + "=" * 80)
+    print("STEP 3: MISSING-VALUE IMPUTATION")
+    print("=" * 80)
+
+    if strategy == "mean":
+        imputer = SimpleImputer(strategy="mean")
+    elif strategy == "median":
+        imputer = SimpleImputer(strategy="median")
+    elif strategy == "knn":
+        neighbors = min(knn_neighbors, max(1, expression_data.shape[0] - 1))
+        imputer = KNNImputer(n_neighbors=neighbors)
+    else:
+        raise ValueError("Imputation strategy must be mean, median, or knn.")
+
+    imputed_data = imputer.fit_transform(expression_data)
+
+    if np.isnan(imputed_data).any():
+        raise ValueError("Missing values remain after imputation.")
+
+    print(f"Imputation strategy: {strategy}")
+    print("Missing-value imputation completed.")
+
+    return imputed_data
+
+
+def select_features(
+    expression_data,
+    labels,
+    gene_names,
+    variance_threshold,
+    candidate_feature_count,
+    minimum_votes,
+    random_state
+):
+    print("\n" + "=" * 80)
+    print("STEP 4: FEATURE FILTERING AND SELECTION")
+    print("=" * 80)
+
+    variance_selector = VarianceThreshold(threshold=variance_threshold)
+    variance_filtered_data = variance_selector.fit_transform(expression_data)
+    variance_mask = variance_selector.get_support()
+    variance_filtered_names = gene_names[variance_mask]
+
+    if variance_filtered_data.shape[1] == 0:
+        raise ValueError(
+            "No features remained after variance filtering. "
+            "Reduce the variance threshold."
+        )
+
+    print(f"Features before variance filtering: {expression_data.shape[1]}")
+    print(f"Features after variance filtering: {variance_filtered_data.shape[1]}")
+
+    scaler = StandardScaler()
+    scaled_data = scaler.fit_transform(variance_filtered_data)
+
+    k_features = min(candidate_feature_count, scaled_data.shape[1])
+
+    anova_selector = SelectKBest(score_func=f_classif, k=k_features)
+    anova_selector.fit(scaled_data, labels)
+    anova_scores = np.nan_to_num(
+        anova_selector.scores_, nan=0.0, posinf=0.0, neginf=0.0
+    )
+
+    mutual_information_selector = SelectKBest(
+        score_func=lambda X, y: mutual_info_classif(
+            X, y, random_state=random_state
+        ),
+        k=k_features
+    )
+    mutual_information_selector.fit(scaled_data, labels)
+    mutual_information_scores = np.nan_to_num(
+        mutual_information_selector.scores_,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0
+    )
+
+    rfe_estimator = LogisticRegression(
+        penalty="l2",
+        C=1.0,
+        max_iter=5000,
+        random_state=random_state,
+        solver="liblinear"
+    )
+    rfe_step = max(1, min(50, scaled_data.shape[1] // 10))
+    rfe_selector = RFE(
+        estimator=rfe_estimator,
+        n_features_to_select=k_features,
+        step=rfe_step
+    )
+    rfe_selector.fit(scaled_data, labels)
+
+    lasso_selector = Lasso(
+        alpha=0.001,
+        max_iter=10000,
+        random_state=random_state
+    )
+    lasso_selector.fit(scaled_data, labels)
+    lasso_coefficients = np.abs(lasso_selector.coef_)
+
+    votes = np.zeros(scaled_data.shape[1], dtype=int)
+    votes[anova_selector.get_support()] += 1
+    votes[mutual_information_selector.get_support()] += 1
+    votes[rfe_selector.get_support()] += 1
+    votes[lasso_coefficients > 0] += 1
+
+    final_mask = votes >= minimum_votes
+
+    if not final_mask.any():
+        highest_vote = int(votes.max())
+        final_mask = votes == highest_vote
+        print(
+            f"No feature reached {minimum_votes} votes. "
+            f"Features with the highest vote count ({highest_vote}) were retained."
+        )
+
+    selected_data = scaled_data[:, final_mask]
+    selected_names = variance_filtered_names[final_mask]
+
+    feature_metadata = pd.DataFrame({
+        "Feature": variance_filtered_names,
+        "ANOVA_Score": anova_scores,
+        "Mutual_Information_Score": mutual_information_scores,
+        "RFE_Selected": rfe_selector.get_support(),
+        "Lasso_Absolute_Coefficient": lasso_coefficients,
+        "Selection_Votes": votes,
+        "Final_Selected": final_mask
+    }).sort_values(
+        by=["Final_Selected", "Selection_Votes", "ANOVA_Score"],
+        ascending=[False, False, False]
+    )
+
+    print(f"Candidate features per selection method: {k_features}")
+    print(f"Minimum selection votes: {minimum_votes}")
+    print(f"Final selected features: {selected_data.shape[1]}")
+
+    return selected_data, selected_names, feature_metadata
+
+
+def build_output_table(
+    selected_data,
+    selected_names,
+    sample_names,
+    survival_days,
+    labels,
+    survival_threshold
+):
+    selected_feature_table = pd.DataFrame(
+        selected_data,
+        columns=selected_names
+    )
+
+    metadata_table = pd.DataFrame({
+        "Sample": sample_names,
+        "Survival_Days": survival_days,
+        "Survival_Threshold": survival_threshold,
+        "Survival_Class": labels,
+        "Survival_Group": np.where(
+            labels == 1,
+            "Long_Survival",
+            "Short_Survival"
+        )
+    })
+
+    return pd.concat(
+        [
+            metadata_table.reset_index(drop=True),
+            selected_feature_table.reset_index(drop=True)
+        ],
+        axis=1
+    )
+
+
+def main():
+    print("Select the input CSV file.")
+    input_path = choose_input_file()
+
+    print("Select the output CSV file.")
+    output_path = choose_output_file()
+
+    survival_threshold = input(
+        "Enter the survival cutoff as 'median' or a numeric value "
+        "[default: median]: "
+    ).strip()
+    survival_threshold = survival_threshold or "median"
+
+    imputation_strategy = input(
+        "Enter the imputation strategy: knn, median, or mean "
+        "[default: knn]: "
+    ).strip().lower()
+    imputation_strategy = imputation_strategy or "knn"
+
+    knn_neighbors = prompt_value(
+        "Enter the number of KNN neighbors",
+        5,
+        int,
+        lambda value: value >= 1
+    )
+
+    variance_threshold = prompt_value(
+        "Enter the variance threshold",
+        0.01,
+        float,
+        lambda value: value >= 0
+    )
+
+    candidate_feature_count = prompt_value(
+        "Enter the maximum number of candidate features per method",
+        300,
+        int,
+        lambda value: value >= 1
+    )
+
+    minimum_votes = prompt_value(
+        "Enter the minimum number of selection votes",
+        2,
+        int,
+        lambda value: 1 <= value <= 4
+    )
+
+    expression_data, survival_days, gene_names, sample_names = load_data(
+        input_path
+    )
+
+    labels, threshold_value = create_survival_labels(
+        survival_days,
+        survival_threshold
+    )
+
+    imputed_data = impute_missing_values(
+        expression_data,
+        imputation_strategy,
+        knn_neighbors
+    )
+
+    selected_data, selected_names, feature_metadata = select_features(
+        imputed_data,
+        labels,
+        gene_names,
+        variance_threshold,
+        candidate_feature_count,
+        minimum_votes,
+        random_state=42
+    )
+
+    output_table = build_output_table(
+        selected_data,
+        selected_names,
+        sample_names,
+        survival_days,
+        labels,
+        threshold_value
+    )
+
+    output_directory = os.path.dirname(os.path.abspath(output_path))
+    os.makedirs(output_directory, exist_ok=True)
+
+    output_table.to_csv(output_path, index=False)
+
+    metadata_path = os.path.join(
+        output_directory,
+        f"{os.path.splitext(os.path.basename(output_path))[0]}"
+        "_feature_selection_details.csv"
+    )
+    feature_metadata.to_csv(metadata_path, index=False)
+
+    print("\n" + "=" * 80)
+    print("DATA PROCESSING AND FEATURE SELECTION COMPLETED")
+    print("=" * 80)
+    print(f"Processed table: {output_path}")
+    print(f"Feature-selection details: {metadata_path}")
+    print(f"Output samples: {output_table.shape[0]}")
+    print(f"Selected features: {len(selected_names)}")
+
+
+if __name__ == "__main__":
+    main()
