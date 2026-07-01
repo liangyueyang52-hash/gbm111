@@ -1,0 +1,543 @@
+rm(list = ls())
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(limma)
+  library(ggplot2)
+  library(pheatmap)
+  library(ggrepel)
+  library(DOSE)
+})
+
+read_numeric_parameter <- function(prompt_text, default_value, lower_bound = NULL, upper_bound = NULL) {
+  user_input <- readline(sprintf("%s [default: %s]: ", prompt_text, default_value))
+
+  if (trimws(user_input) == "") {
+    value <- default_value
+  } else {
+    value <- suppressWarnings(as.numeric(user_input))
+  }
+
+  if (is.na(value)) {
+    stop(sprintf("Invalid numeric value entered for: %s", prompt_text))
+  }
+
+  if (!is.null(lower_bound) && value < lower_bound) {
+    stop(sprintf("The value for '%s' must be at least %s.", prompt_text, lower_bound))
+  }
+
+  if (!is.null(upper_bound) && value > upper_bound) {
+    stop(sprintf("The value for '%s' must not exceed %s.", prompt_text, upper_bound))
+  }
+
+  value
+}
+
+save_enrichment_results <- function(enrichment_result,
+                                    csv_filename,
+                                    plot_filename,
+                                    plot_title,
+                                    output_dir,
+                                    show_category = 20,
+                                    plot_width = 10,
+                                    plot_height = 8,
+                                    axis_text_size = 9,
+                                    axis_title_size = 10,
+                                    title_size = 12,
+                                    legend_text_size = 9,
+                                    legend_title_size = 10) {
+  if (is.null(enrichment_result)) {
+    return(invisible(NULL))
+  }
+
+  result_df <- as.data.frame(enrichment_result)
+
+  if (nrow(result_df) == 0) {
+    return(invisible(NULL))
+  }
+
+  write_csv(result_df, file.path(output_dir, csv_filename))
+
+  enrichment_plot <- dotplot(
+    enrichment_result,
+    showCategory = show_category,
+    title = plot_title
+  ) +
+    theme(
+      axis.text = element_text(size = axis_text_size),
+      axis.title = element_text(size = axis_title_size),
+      plot.title = element_text(size = title_size, face = "bold"),
+      legend.text = element_text(size = legend_text_size),
+      legend.title = element_text(size = legend_title_size)
+    )
+
+  ggsave(
+    filename = file.path(output_dir, plot_filename),
+    plot = enrichment_plot,
+    width = plot_width,
+    height = plot_height,
+    dpi = 300
+  )
+
+  invisible(enrichment_plot)
+}
+
+run_go_enrichment <- function(gene_vector,
+                              universe_genes,
+                              output_prefix,
+                              plot_title,
+                              output_dir,
+                              enrichment_p_cutoff,
+                              enrichment_q_cutoff,
+                              plot_width = 10,
+                              plot_height = 8,
+                              axis_text_size = 9,
+                              axis_title_size = 10,
+                              title_size = 12,
+                              legend_text_size = 9,
+                              legend_title_size = 10) {
+  if (length(gene_vector) == 0) {
+    return(NULL)
+  }
+
+  enrichment_result <- enrichGO(
+    gene = unique(gene_vector),
+    universe = unique(universe_genes),
+    OrgDb = org.Hs.eg.db,
+    keyType = "SYMBOL",
+    ont = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff = enrichment_p_cutoff,
+    qvalueCutoff = enrichment_q_cutoff,
+    readable = TRUE
+  )
+
+  save_enrichment_results(
+    enrichment_result = enrichment_result,
+    csv_filename = paste0("GO_enrichment_", output_prefix, ".csv"),
+    plot_filename = paste0("GO_dotplot_", output_prefix, ".png"),
+    plot_title = plot_title,
+    output_dir = output_dir,
+    plot_width = plot_width,
+    plot_height = plot_height,
+    axis_text_size = axis_text_size,
+    axis_title_size = axis_title_size,
+    title_size = title_size,
+    legend_text_size = legend_text_size,
+    legend_title_size = legend_title_size
+  )
+
+  enrichment_result
+}
+
+run_kegg_enrichment <- function(gene_vector,
+                                output_prefix,
+                                plot_title,
+                                output_dir,
+                                enrichment_p_cutoff,
+                                enrichment_q_cutoff,
+                                plot_width = 10,
+                                plot_height = 8,
+                                axis_text_size = 9,
+                                axis_title_size = 10,
+                                title_size = 12,
+                                legend_text_size = 9,
+                                legend_title_size = 10) {
+  if (length(gene_vector) == 0) {
+    return(NULL)
+  }
+
+  entrez_table <- bitr(
+    unique(gene_vector),
+    fromType = "SYMBOL",
+    toType = "ENTREZID",
+    OrgDb = org.Hs.eg.db
+  )
+
+  if (is.null(entrez_table) || nrow(entrez_table) == 0) {
+    return(NULL)
+  }
+
+  enrichment_result <- enrichKEGG(
+    gene = unique(entrez_table$ENTREZID),
+    organism = "hsa",
+    pvalueCutoff = enrichment_p_cutoff,
+    qvalueCutoff = enrichment_q_cutoff
+  )
+
+  save_enrichment_results(
+    enrichment_result = enrichment_result,
+    csv_filename = paste0("KEGG_enrichment_", output_prefix, ".csv"),
+    plot_filename = paste0("KEGG_dotplot_", output_prefix, ".png"),
+    plot_title = plot_title,
+    output_dir = output_dir,
+    plot_width = plot_width,
+    plot_height = plot_height,
+    axis_text_size = axis_text_size,
+    axis_title_size = axis_title_size,
+    title_size = title_size,
+    legend_text_size = legend_text_size,
+    legend_title_size = legend_title_size
+  )
+
+  enrichment_result
+}
+
+input_file <- file.choose()
+
+output_dir <- readline(
+  "Enter the output directory path [default: directory containing the input file]: "
+)
+
+if (trimws(output_dir) == "") {
+  output_dir <- dirname(input_file)
+}
+
+output_dir <- normalizePath(output_dir, winslash = "/", mustWork = FALSE)
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+}
+
+if (!dir.exists(output_dir)) {
+  stop("The output directory could not be created.")
+}
+
+logfc_cutoff <- read_numeric_parameter(
+  prompt_text = "Enter the absolute log2 fold-change cutoff",
+  default_value = 0.4,
+  lower_bound = 0
+)
+
+adjusted_p_cutoff <- read_numeric_parameter(
+  prompt_text = "Enter the adjusted P-value cutoff for differential genes",
+  default_value = 0.1,
+  lower_bound = 0,
+  upper_bound = 1
+)
+
+enrichment_p_cutoff <- read_numeric_parameter(
+  prompt_text = "Enter the enrichment P-value cutoff",
+  default_value = 0.05,
+  lower_bound = 0,
+  upper_bound = 1
+)
+
+enrichment_q_cutoff <- read_numeric_parameter(
+  prompt_text = "Enter the enrichment q-value cutoff",
+  default_value = 0.2,
+  lower_bound = 0,
+  upper_bound = 1
+)
+
+top_gene_count <- as.integer(read_numeric_parameter(
+  prompt_text = "Enter the number of genes to label in the volcano plot",
+  default_value = 10,
+  lower_bound = 0
+))
+
+df <- read_csv(input_file, show_col_types = FALSE)
+
+if (nrow(df) < 2 || ncol(df) < 2) {
+  stop("The input file must contain at least two rows and two columns.")
+}
+
+survival_data <- suppressWarnings(as.numeric(unlist(df[1, -1], use.names = FALSE)))
+
+gene_expression <- df[-1, ]
+gene_names <- as.character(gene_expression[[1]])
+
+expression_matrix <- as.matrix(gene_expression[, -1])
+storage.mode(expression_matrix) <- "numeric"
+rownames(expression_matrix) <- gene_names
+
+if (length(survival_data) != ncol(expression_matrix)) {
+  stop("The number of survival values does not match the number of expression samples.")
+}
+
+if (anyDuplicated(gene_names) > 0) {
+  warning("Duplicate gene names were detected. Duplicate rows will be retained.")
+}
+
+survival_median <- median(survival_data, na.rm = TRUE)
+
+group <- ifelse(survival_data > survival_median, "High", "Low")
+group <- factor(group, levels = c("Low", "High"))
+
+cat("Survival-time median:", survival_median, "\n")
+cat("Number of samples in the Low group:", sum(group == "Low", na.rm = TRUE), "\n")
+cat("Number of samples in the High group:", sum(group == "High", na.rm = TRUE), "\n")
+cat("Absolute log2 fold-change cutoff:", logfc_cutoff, "\n")
+cat("Adjusted P-value cutoff:", adjusted_p_cutoff, "\n")
+
+valid_samples <- !is.na(survival_data)
+
+if (sum(valid_samples) < 3) {
+  stop("At least three samples with non-missing survival values are required.")
+}
+
+expression_matrix_analysis <- expression_matrix[, valid_samples, drop = FALSE]
+group_analysis <- droplevels(group[valid_samples])
+
+if (nlevels(group_analysis) < 2) {
+  stop("Both the Low and High groups must contain at least one valid sample.")
+}
+
+design <- model.matrix(~ 0 + group_analysis)
+colnames(design) <- levels(group_analysis)
+
+fit <- lmFit(expression_matrix_analysis, design)
+
+contrast_matrix <- makeContrasts(
+  High_vs_Low = High - Low,
+  levels = design
+)
+
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2)
+
+results <- topTable(
+  fit2,
+  number = Inf,
+  adjust.method = "BH",
+  sort.by = "P"
+)
+
+results$Gene <- rownames(results)
+results <- results[, c("Gene", "logFC", "AveExpr", "t", "P.Value", "adj.P.Val", "B")]
+
+deg_results <- results %>%
+  mutate(
+    Regulation = case_when(
+      logFC > logfc_cutoff & adj.P.Val < adjusted_p_cutoff ~ "Up",
+      logFC < -logfc_cutoff & adj.P.Val < adjusted_p_cutoff ~ "Down",
+      TRUE ~ "Not Significant"
+    )
+  )
+
+deg_summary <- deg_results %>%
+  count(Regulation, name = "Count") %>%
+  complete(
+    Regulation = c("Up", "Down", "Not Significant"),
+    fill = list(Count = 0)
+  )
+
+cat("Differential-expression summary:\n")
+print(deg_summary)
+
+write_csv(
+  deg_results,
+  file.path(output_dir, "differential_expression_results.csv")
+)
+
+write_csv(
+  deg_results %>% filter(Regulation %in% c("Up", "Down")),
+  file.path(output_dir, "significant_differential_genes.csv")
+)
+
+volcano_data <- deg_results %>%
+  mutate(
+    PlotAdjustedP = pmax(adj.P.Val, .Machine$double.xmin)
+  )
+
+volcano_plot <- ggplot(
+  volcano_data,
+  aes(x = logFC, y = -log10(PlotAdjustedP))
+) +
+  geom_point(
+    aes(color = Regulation),
+    alpha = 0.6,
+    size = 1.5
+  ) +
+  scale_color_manual(
+    values = c(
+      "Down" = "blue",
+      "Not Significant" = "gray",
+      "Up" = "red"
+    )
+  ) +
+  geom_hline(
+    yintercept = -log10(adjusted_p_cutoff),
+    linetype = "dashed",
+    color = "black"
+  ) +
+  geom_vline(
+    xintercept = c(-logfc_cutoff, logfc_cutoff),
+    linetype = "dashed",
+    color = "black"
+  ) +
+  labs(
+    title = "Volcano Plot of Differential Expression",
+    x = "Log2 Fold Change",
+    y = "-Log10 Adjusted P-value",
+    color = "Regulation"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+
+top_genes <- volcano_data %>%
+  filter(Regulation %in% c("Up", "Down")) %>%
+  arrange(adj.P.Val, desc(abs(logFC))) %>%
+  slice_head(n = top_gene_count)
+
+volcano_plot_labeled <- volcano_plot
+
+if (nrow(top_genes) > 0) {
+  volcano_plot_labeled <- volcano_plot_labeled +
+    geom_text_repel(
+      data = top_genes,
+      aes(label = Gene),
+      size = 3,
+      box.padding = 0.5,
+      max.overlaps = 20
+    )
+}
+
+ggsave(
+  filename = file.path(output_dir, "volcano_plot.png"),
+  plot = volcano_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(output_dir, "volcano_plot_labeled.png"),
+  plot = volcano_plot_labeled,
+  width = 10,
+  height = 8,
+  dpi = 300
+)
+
+sig_genes <- deg_results %>%
+  filter(Regulation %in% c("Up", "Down")) %>%
+  pull(Gene)
+
+if (length(sig_genes) > 0) {
+  sig_expr <- expression_matrix_analysis[sig_genes, , drop = FALSE]
+
+  annotation_col <- data.frame(
+    Group = group_analysis,
+    Survival = survival_data[valid_samples]
+  )
+  rownames(annotation_col) <- colnames(expression_matrix_analysis)
+
+  pheatmap(
+    sig_expr,
+    scale = "row",
+    cluster_rows = TRUE,
+    cluster_cols = TRUE,
+    annotation_col = annotation_col,
+    show_colnames = FALSE,
+    show_rownames = length(sig_genes) <= 50,
+    fontsize_row = 8,
+    main = "Heatmap of Significant Differential Genes",
+    filename = file.path(output_dir, "differential_genes_heatmap.png"),
+    width = 10,
+    height = max(6, length(sig_genes) * 0.15)
+  )
+} else {
+  message("No significant differential genes were found. The heatmap was not generated.")
+}
+
+up_genes <- deg_results %>%
+  filter(Regulation == "Up") %>%
+  pull(Gene)
+
+down_genes <- deg_results %>%
+  filter(Regulation == "Down") %>%
+  pull(Gene)
+
+run_go_enrichment(
+  gene_vector = up_genes,
+  universe_genes = gene_names,
+  output_prefix = "up",
+  plot_title = "GO Enrichment: Up-regulated Genes",
+  output_dir = output_dir,
+  enrichment_p_cutoff = enrichment_p_cutoff,
+  enrichment_q_cutoff = enrichment_q_cutoff
+)
+
+run_go_enrichment(
+  gene_vector = down_genes,
+  universe_genes = gene_names,
+  output_prefix = "down",
+  plot_title = "GO Enrichment: Down-regulated Genes",
+  output_dir = output_dir,
+  enrichment_p_cutoff = enrichment_p_cutoff,
+  enrichment_q_cutoff = enrichment_q_cutoff
+)
+
+run_kegg_enrichment(
+  gene_vector = up_genes,
+  output_prefix = "up",
+  plot_title = "KEGG Enrichment: Up-regulated Genes",
+  output_dir = output_dir,
+  enrichment_p_cutoff = enrichment_p_cutoff,
+  enrichment_q_cutoff = enrichment_q_cutoff
+)
+
+run_kegg_enrichment(
+  gene_vector = down_genes,
+  output_prefix = "down",
+  plot_title = "KEGG Enrichment: Down-regulated Genes",
+  output_dir = output_dir,
+  enrichment_p_cutoff = enrichment_p_cutoff,
+  enrichment_q_cutoff = enrichment_q_cutoff
+)
+
+all_diff_genes <- unique(c(up_genes, down_genes))
+
+run_go_enrichment(
+  gene_vector = all_diff_genes,
+  universe_genes = gene_names,
+  output_prefix = "all",
+  plot_title = "GO Enrichment: All Differential Genes",
+  output_dir = output_dir,
+  enrichment_p_cutoff = enrichment_p_cutoff,
+  enrichment_q_cutoff = enrichment_q_cutoff,
+  plot_width = 12,
+  plot_height = 10,
+  axis_text_size = 8,
+  axis_title_size = 9,
+  title_size = 11,
+  legend_text_size = 8,
+  legend_title_size = 9
+)
+
+run_kegg_enrichment(
+  gene_vector = all_diff_genes,
+  output_prefix = "all",
+  plot_title = "KEGG Enrichment: All Differential Genes",
+  output_dir = output_dir,
+  enrichment_p_cutoff = enrichment_p_cutoff,
+  enrichment_q_cutoff = enrichment_q_cutoff,
+  plot_width = 12,
+  plot_height = 10,
+  axis_text_size = 8,
+  axis_title_size = 9,
+  title_size = 11,
+  legend_text_size = 8,
+  legend_title_size = 9
+)
+
+cat("\n======= Analysis completed =======\n")
+cat("Completion time:", date(), "\n")
+cat("Input file:", normalizePath(input_file, winslash = "/"), "\n")
+cat("Output directory:", output_dir, "\n")
+cat("Total number of genes:", length(gene_names), "\n")
+cat("Number of up-regulated genes:", length(up_genes), "\n")
+cat("Number of down-regulated genes:", length(down_genes), "\n")
+cat("Total number of differential genes:", length(all_diff_genes), "\n")
+cat("Absolute log2 fold-change cutoff:", logfc_cutoff, "\n")
+cat("Adjusted P-value cutoff:", adjusted_p_cutoff, "\n")
+cat("Enrichment P-value cutoff:", enrichment_p_cutoff, "\n")
+cat("Enrichment q-value cutoff:", enrichment_q_cutoff, "\n")
+cat("All result files were saved to the selected output directory.\n")
+
+sessionInfo()
